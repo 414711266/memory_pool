@@ -30,10 +30,16 @@
 ### 内存池的缺点
 
 - **初始内存占用**：内存池需预先分配较大内存区域，可能造成部分内存浪费。比如在一个小型程序中，预先分配了较大内存池，但实际使用量很少，就浪费了内存。
+
 - **复杂性**：实现和调试内存池代码比直接使用 malloc/new 更复杂。例如内存池的内存分配算法、回收机制等实现起来较为复杂，调试时也更困难。
+
 - **不适合大型对象**：对于大对象的分配，使用内存池可能不划算。比如在处理大型图像数据时，使用内存池可能不如直接使用系统内存分配高效。
 
-## 背景与需求
+## 实现步骤
+
+从一个实际的需求场景出发，逐步构建和优化这个内存池项目。
+
+### 背景与需求
 
 假设你正在开发一个高性能的网络服务器。这个服务器需要处理大量的客户端连接，并且为每个连接或每个请求，都需要动态地创建和销毁一些小对象。比如：
 
@@ -55,3 +61,147 @@
 - **多线程竞争**：在多线程环境下，全局的堆分配器通常需要加锁来保证线程安全，这会成为并发瓶颈。
 
 **我们的初步目标：** 为了解决这个问题，我们希望设计一个**内存池 (Memory Pool)**。它的基本思想是：一次性向操作系统申请一大块内存，然后在这块大内存中手动管理小块内存的分配和回收。这样可以绕开大部分系统调用，减少碎片，并可能实现更高效的分配策略。
+
+### 一、简单内存池，只分配，不回收的内存块
+
+创建一个最基础的内存分配器，它能从预先分配的一大块内存中切出小块内存。为了简化，我们暂时不考虑内存回收和线程安全问题。
+
+#### SimpleMemoryBlock.h
+
+```c++
+#pragma once
+
+#include<iostream>
+
+class SimpleMemoryBlock
+{
+public:
+	SimpleMemoryBlock() noexcept = default;
+	SimpleMemoryBlock(size_t blockSize = 4096);
+
+	~SimpleMemoryBlock();
+
+	void* allocate(size_t size);
+
+private:
+	char* pBlock;         // 指向内存块的指针
+	size_t blockSize;   // 内存块的总大小
+	char* pCurrent;   // 指向当前可分配位置的指针
+};
+```
+
+#### SimpleMemoryBlock.cpp
+
+```c++
+#include "SimpleMemoryBlock.h"
+// #include <new>
+
+SimpleMemoryBlock::SimpleMemoryBlock(size_t blockSize)
+	: blockSize(blockSize),
+	pCurrent(nullptr)
+{
+	// 申请一大块内存
+	pBlock = new(std::nothrow) char[blockSize];
+	if (pBlock == nullptr) {
+		// 实际项目中可能需要更健壮的错误处理，比如抛出异常
+		std::cerr << "SimpleMemoryBlock: 初始分配 " << blockSize << " 字节内存失败!" << std::endl;
+	}
+	pCurrent = pBlock; // 初始时，可分配位置就是块的起始位置
+	std::cout << "SimpleMemoryBlock: 成功初始化，分配了 " << blockSize << " 字节。" << std::endl;
+}
+
+SimpleMemoryBlock::~SimpleMemoryBlock()
+{
+	delete[] pBlock; // 释放整个内存块
+	std::cout << "SimpleMemoryBlock: 内存块已释放。" << std::endl;
+}
+
+void* SimpleMemoryBlock::allocate(size_t size)
+{
+	if (pBlock == nullptr) { // 如果初始分配失败
+		return nullptr;
+	}
+
+	// 暂时不做严格的边界检查，假设总能分配成功
+	// 实际应该检查: pCurrent + size <= pBlock + blockSize
+	if (pCurrent + size > pBlock + blockSize) {
+		std::cerr << "SimpleMemoryBlock: 请求分配 " << size << " 字节失败，内存不足!" << std::endl;
+		return nullptr; // 分配失败
+	}
+
+	void* allocated_memory = static_cast<void*>(pCurrent);
+	pCurrent += size; // 移动指针，准备下一次分配
+	// std::cout << "SimpleMemoryBlock: 分配了 " << size << " 字节。剩余: " << (pBlock + blockSize - pCurrent) << " 字节。" << std::endl;
+	return allocated_memory;
+}
+
+```
+
+#### main.cpp
+
+```c++
+// 预先向系统申请一大片内存，并交由应用层管理，在程序运行时，
+// 内存的分配和回收都由应用层的内存池处理，从而减少系统调用。
+// 2025年5月24日22:30:30
+
+#include <iostream>
+#include "SimpleMemoryBlock.h"
+
+// sizeof为20
+struct MyData {
+    int id;
+    char name[16];
+};
+
+int main()
+{
+    SimpleMemoryBlock block(1024); // 创建一个1KB的内存块
+    // 第一次分配
+    void* mem1 = block.allocate(sizeof(MyData));
+    if (mem1) {
+        MyData* data1 = static_cast<MyData*>(mem1);
+        data1->id = 1;
+        // strcpy(data1->name, "Object1"); // 注意strcpy的安全性
+        snprintf(data1->name, sizeof(data1->name), "对象1"); // 使用 snprintf 更安全
+        std::cout << "分配 MyData 于 " << data1 << ", ID: " << data1->id << ", 名称: " << data1->name << std::endl;
+    }
+    else {
+        std::cout << "分配 mem1 失败" << std::endl;
+    }
+
+    // 第二次分配
+    void* mem2 = block.allocate(100); // 分配100字节
+    if (mem2) {
+        std::cout << "分配 100 字节于 " << mem2 << std::endl;
+    }
+    else {
+        std::cout << "分配 mem2 失败" << std::endl;
+    }
+
+    // 尝试分配一个会超出剩余空间的内存 (如果SimpleMemoryBlock够小，或者分配次数够多)
+    void* mem3 = block.allocate(2000); // 尝试分配一个大于总块大小的内存 (或者大于剩余)
+    if (mem3) {
+        std::cout << "分配 2000 字节于 " << mem3 << std::endl;
+    }
+    else {
+        std::cout << "分配 mem3 失败 (空间不足，符合预期)" << std::endl;
+    }
+
+    // 注意：这里分配的内存并没有单独释放，它们会在 block 对象析构时随着整个大块内存一起被释放。
+    // 这就是这个最简单版本内存池的特点：“只分配，不回收单个对象”。
+
+    return 0;
+}
+```
+
+#### 局限性
+
+- **无法回收单个对象**：我们只能分配，不能单独 `deallocate` 某个对象并重用那块内存。一旦分配出去，那块内存就一直被占用，直到整个 `SimpleMemoryBlock` 对象销毁。
+
+- **内存浪费（对齐问题）**：我们现在是按需分配 `size` 大小的内存。如果CPU对某些数据类型的访问有对齐要求（比如 `int` 通常要求4字节对齐，`double` 要求8字节对齐），直接这样连续分配可能会导致未对齐的内存地址，从而引发性能下降甚至错误。我们分配的 `void*` 没有考虑这一点。
+
+- **固定大小的内存块**：如果所有对象都分配完了，就不能再分配了，除非创建新的 `SimpleMemoryBlock`。
+
+- **线程不安全**：如果多个线程同时调用 `block.allocate()`，`pCurrent += size;` 这行代码会有竞态条件，导致严重错误。
+
+- **只能处理特定大小的对象吗？** 目前可以处理任意大小的请求（只要总容量够），但如果我们想针对特定大小的对象做优化（比如都分配8字节、16字节的块），现在的设计还不够。
