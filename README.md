@@ -205,3 +205,278 @@ int main()
 - **线程不安全**：如果多个线程同时调用 `block.allocate()`，`pCurrent += size;` 这行代码会有竞态条件，导致严重错误。
 
 - **只能处理特定大小的对象吗？** 目前可以处理任意大小的请求（只要总容量够），但如果我们想针对特定大小的对象做优化（比如都分配8字节、16字节的块），现在的设计还不够。
+
+### 二、简单的内存回收 - 侵入式链表管理空闲块
+
+希望能够 `deallocate` 一个不再使用的内存块，并且让这块内存能够被后续的 `allocate` 请求再次使用。
+
+#### 设计思路
+
+**空闲链表 (Free List)**：当一块内存被释放时，不把它还给操作系统，而是把它链接到一个“空闲块列表”中。当需要分配内存时，我们首先检查这个空闲链表是否有合适的内存块，如果有，就直接取出来用。
+
+**侵入式链表 (Intrusive Linked List)**：为了管理这些空闲块，我们需要在每个内存块的头部（或者说，把内存块本身“看作”一个链表节点）存储一个指向下一个空闲块的指针。这就是所谓的“侵入式”设计，因为链表的结构信息是直接存储在被管理的数据块内部的。
+
+**`Slot` 结构**：我们定义一个简单的结构体，比如叫 `FreeSlot`，它至少包含一个指向下一个 `FreeSlot` 的指针。当我们分配一块内存时，其大小至少要能容纳一个 `FreeSlot` 结构。
+
+```c++
+struct FreeSlot {
+	FreeSlot* pNext;
+};
+```
+
+**分配逻辑修改 `allocate(size_t size)`**：
+
+- 首先检查空闲链表。如果空闲链表不为空，并且链表头部的空闲块大小**恰好**等于（或者大于，但为了简单起见，我们先要求恰好等于）请求的 `size`，则从空闲链表中移除这个块并返回。
+- 如果空闲链表为空或没有合适的块，再从 `pCurrent` 指向的大块内存中切分，同上一步。
+
+**释放逻辑 `deallocate(void* ptr, size_t size)`**：
+
+- 将 `ptr` 指向的内存块转换成 `FreeSlot*`。
+- 将其插入到空闲链表的头部。
+
+**简化**
+
+- 假设我们管理的内存池是用来分配**固定大小**的对象的。这意味着 `allocate(size_t size)` 中的 `size` 总是同一个值，并且这个 `size` 必须大于等于 `sizeof(FreeSlot)`。
+
+#### SimpleMemoryBlock.h
+
+```c++
+#pragma once
+
+#include<iostream>
+
+// 定义空闲节点的结构 (对应你项目中的 Slot)
+struct FreeSlot {
+	FreeSlot* pNext;
+};
+
+class SimpleMemoryBlock
+{
+public:
+	SimpleMemoryBlock() noexcept = default;
+	SimpleMemoryBlock(size_t slotSize, size_t initialBlockSize = 4096);
+
+	~SimpleMemoryBlock();
+
+	void* allocate(); // 不再传入size，因为slotSize是固定的
+	void deallocate(void* ptr); // 不再传入size
+
+private:
+	char* pBlock;         // 指向内存块的指针
+	size_t blockSize;   // 内存块的总大小
+	char* pCurrent;   // 指向当前可分配位置的指针
+	char* pEnd;           // 指向大内存块的末尾，用于边界检查
+
+	FreeSlot* pFreeList;  // 指向空闲内存块链表的头部
+
+	//内存池只分配固定大小的内存块 (slotSize_)。这个大小在内存池初始化时指定。
+	size_t slotSize_;     // 每个分配单元（槽）的大小
+};
+```
+
+#### SimpleMemoryBlock.cpp
+
+```c++
+#include "SimpleMemoryBlock.h"
+#include <cassert>
+// #include <new>
+
+SimpleMemoryBlock::SimpleMemoryBlock(size_t slotSize, size_t initialBlockSize)
+	: pBlock(nullptr),
+	blockSize(initialBlockSize),
+	pCurrent(nullptr),
+	pEnd(nullptr),
+	pFreeList(nullptr),
+	slotSize_(slotSize)
+{
+	// 确保每个槽的大小至少能容纳一个 FreeSlot 指针
+	assert(slotSize_ >= sizeof(FreeSlot) && "slotSize must be at least sizeof(FreeSlot)");
+
+	pBlock = new (std::nothrow) char[blockSize];
+	if (pBlock == nullptr) {
+		std::cerr << "SimpleMemoryBlock: 初始分配 " << blockSize << " 字节内存失败!" << std::endl;
+		// 在实际项目中，这里可能需要抛出异常或有更复杂的错误处理
+		return;
+	}
+
+	pCurrent = pBlock;
+	pEnd = pBlock + blockSize; // 计算大块内存的末尾
+	std::cout << "SimpleMemoryBlock: 成功初始化，总容量 " << blockSize << " 字节, 单个槽大小 " << slotSize_ << " 字节。" << std::endl;
+
+}
+
+
+
+SimpleMemoryBlock::~SimpleMemoryBlock()
+{
+	delete[] pBlock; // 释放整个内存块
+	std::cout << "SimpleMemoryBlock: 内存块已释放。" << std::endl;
+}
+
+void* SimpleMemoryBlock::allocate()
+{
+	// 1. 优先从空闲链表分配
+	if (pFreeList != nullptr) {
+		void* memory = static_cast<void*>(pFreeList);
+		pFreeList = pFreeList->pNext; // 移动空闲链表头指针
+		// std::cout << "SimpleMemoryBlock: 从空闲链表分配了 " << slotSize_ << " 字节。" << std::endl;
+		return memory;
+	}
+
+	// 2. 空闲链表为空，则从大块内存中分配
+	// 检查大块内存是否还有足够空间 (pCurrent 加上 slotSize_ 是否会超过 pEnd)
+	if (pCurrent + slotSize_ <= pEnd) {
+		void* memory = static_cast<void*>(pCurrent);
+		pCurrent += slotSize_; // 移动当前大块内存的分配指针
+		// std::cout << "SimpleMemoryBlock: 从主内存块分配了 " << slotSize_ << " 字节。" << std::endl;
+		return memory;
+	}
+
+	// std::cout << "SimpleMemoryBlock: 内存不足，无法分配 " << slotSize_ << " 字节。" << std::endl;
+	return nullptr; // 所有内存都用完了
+}
+
+void SimpleMemoryBlock::deallocate(void* ptr) {
+	if (ptr == nullptr) {
+		return;
+	}
+
+	// 将释放的内存块转换为 FreeSlot*，并将其加入空闲链表的头部
+	FreeSlot* releasedSlot = static_cast<FreeSlot*>(ptr);
+	releasedSlot->pNext = pFreeList;
+	pFreeList = releasedSlot;
+	// std::cout << "SimpleMemoryBlock: 回收了 " << slotSize_ << " 字节到空闲链表。" << std::endl;
+}
+```
+
+#### main.cpp
+
+```c++
+// 预先向系统申请一大片内存，并交由应用层管理，在程序运行时，
+// 内存的分配和回收都由应用层的内存池处理，从而减少系统调用。
+// 2025年5月24日22:30:30
+
+#include <iostream>
+#include <vector>
+#include "SimpleMemoryBlock.h"
+
+struct MyFixedSizeData {
+    int id;
+    char data[12]; // 假设 MyFixedSizeData 大小为 16 字节 (int:4 + char[12]:12)
+                   // 或者为了确保至少能放下 FreeSlot*，我们可以调整
+                   // 如果 FreeSlot* 是8字节，那么char data[8] 即可使总大小为16
+};
+const size_t FIXED_DATA_SIZE = sizeof(MyFixedSizeData);
+
+
+int main()
+{
+    // 假设 FreeSlot* 是 8 字节，MyFixedSizeData 是 16 字节
+    // 我们创建一个内存池，每个槽16字节，总共能放比如 5 个这样的对象 (16 * 5 = 80 字节)
+    // 为了测试方便，我们让 slotSize 直接等于 FIXED_DATA_SIZE
+    // 但要确保 FIXED_DATA_SIZE >= sizeof(FreeSlot)
+    if (FIXED_DATA_SIZE < sizeof(FreeSlot)) {
+        std::cerr << "错误: MyFixedSizeData (" << FIXED_DATA_SIZE
+            << " bytes) 太小，无法容纳 FreeSlot* (" << sizeof(FreeSlot)
+            << " bytes)." << std::endl;
+        return 1;
+    }
+
+    SimpleMemoryBlock pool(FIXED_DATA_SIZE, FIXED_DATA_SIZE * 5); // 池子能放5个对象
+
+    std::vector<MyFixedSizeData*> allocatedObjects;
+
+    // 1. 分配直到池满
+    std::cout << "\n--- 阶段1: 分配直到池满 ---" << std::endl;
+    for (int i = 0; i < 7; ++i) { // 尝试分配7个，但池子只能放5个
+        MyFixedSizeData* obj = static_cast<MyFixedSizeData*>(pool.allocate());
+        if (obj) {
+            obj->id = i + 1;
+            snprintf(obj->data, sizeof(obj->data), "Obj%d", obj->id);
+            allocatedObjects.push_back(obj);
+            std::cout << "分配: ID " << obj->id << " (" << obj->data << ") at " << obj << std::endl;
+        }
+        else {
+            std::cout << "分配失败 (预期池满)。尝试分配第 " << (i + 1) << " 个对象。" << std::endl;
+            break; // 池满了就停止
+        }
+    }
+
+    std::cout << "\n当前已分配对象数量: " << allocatedObjects.size() << std::endl;
+
+    // 2. 释放一些对象
+    std::cout << "\n--- 阶段2: 释放部分对象 ---" << std::endl;
+    if (allocatedObjects.size() >= 2) {
+        MyFixedSizeData* objToFree1 = allocatedObjects[1]; // 释放第2个 (index 1)
+        MyFixedSizeData* objToFree2 = allocatedObjects[3]; // 释放第4个 (index 3)
+        std::cout << "准备释放: ID " << objToFree1->id << " at " << objToFree1 << std::endl;
+        pool.deallocate(objToFree1);
+        std::cout << "准备释放: ID " << objToFree2->id << " at " << objToFree2 << std::endl;
+        pool.deallocate(objToFree2);
+        // 从 vector 中移除，避免悬空指针 (实际应用中需要更小心的管理)
+        // 这里简单处理，不从 vector 中移除，只是为了演示地址复用
+    }
+
+    // 3. 尝试重新分配，看是否复用了已释放的内存
+    std::cout << "\n--- 阶段3: 尝试重新分配 ---" << std::endl;
+    for (int i = 0; i < 3; ++i) { // 尝试再分配3个
+        MyFixedSizeData* obj = static_cast<MyFixedSizeData*>(pool.allocate());
+        if (obj) {
+            obj->id = 100 + i; // 用新的 id 标记
+            snprintf(obj->data, sizeof(obj->data), "ReObj%d", obj->id);
+            // allocatedObjects.push_back(obj); // 如果上面没移除，这里要注意
+            std::cout << "重新分配: ID " << obj->id << " (" << obj->data << ") at " << obj << std::endl;
+            // 观察这里的 obj 地址是否和之前释放的地址相同
+        }
+        else {
+            std::cout << "重新分配失败。尝试第 " << (i + 1) << " 次重新分配。" << std::endl;
+            break;
+        }
+    }
+
+    std::cout << "\n--- 测试结束 ---" << std::endl;
+    // allocatedObjects 中的内存在 pool 析构时会被间接处理（因为整个pBlock被delete）
+    // 但理想情况下，所有分配的对象都应该在使用完毕后 deallocate
+    return 0;
+}
+```
+
+#### 局限性
+
+**单一内存块，无法扩容**：
+
+- `SimpleMemoryBlock` 初始化时分配一块固定大小的原始内存 (`pBlock`)。一旦这块内存（包括从空闲链表回收的）都用完了，就无法再分配新的内存了，除非销毁重建整个 `SimpleMemoryBlock`。
+
+**线程不安全**：
+
+- `allocate()` 和 `deallocate()` 方法中对 `pFreeList`、`pCurrent` 的读写操作没有加锁。如果在多线程环境下，多个线程同时调用这些方法，会导致数据竞争，空闲链表和 `pCurrent` 的状态会错乱，可能导致同一块内存被分配给多个线程，或者导致程序崩溃。
+
+#### 侵入式链表回收机制
+
+单独定义一个`FreeSlot`结构体，用于实现侵入式链表。其中只包含了一个指针，为什么不直接用指针来替代呢？
+
+**侵入式链表**是一种特殊的链表实现方式，其关键特点是：**链表节点的指针直接存储在被管理对象的内存空间内**，而不是为链表节点单独分配内存。
+
+![image](img/内存池中的侵入式链表工作原理.png)
+
+##### 特点优势
+
+- **自文档化代码**：明确表明这块内存的用途是作为空闲链表节点
+- 代码意图更明确，表示"这是一个空闲内存块链表节点"
+- 使用结构体：编译器可以检查类型错误
+- **扩展性**：可以轻松添加新字段（如块大小、调试信息等）
+
+##### 工作流程
+
+1. **分配**：优先从`pFreeList`指向的链表获取内存
+   - 获取到的内存块前几个字节曾经存储`FreeSlot::pNext`
+   - 这些字节会被用户数据覆盖（存储用户数据）
+   - `pFreeList`指向next（向后移动，重新指向已释放的空块）
+2. **释放**：将内存块转为`FreeSlot`并插入到链表头
+   - 内存块的前几个字节被重新解释为`FreeSlot::pNext`
+   - 用户数据仍然存在，但被"遗忘"（不再访问）
+   - 该内存插入到链表头部
+
+这种方法的巧妙之处在于：**当内存块不被用于存储用户数据时，同一块内存被重新用于存储链表信息**，实现了零额外内存开销的空闲块管理。
+
+侵入式链表是高性能内存管理的关键技术，它被广泛应用于操作系统内核、内存分配器和高性能服务器等场景。
