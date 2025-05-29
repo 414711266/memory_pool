@@ -495,7 +495,7 @@ int main()
   - 更新 `pCurrent` 指针，使其指向这个新内存块中可用于分配的起始位置。同时也要更新 `pEnd` (标记新块的结束)。
 - 将 `SimpleMemoryBlock` 重命名为 `MemoryPool`
 
-#### 重命名并修改 `MemoryPool.h` (原 `SimpleMemoryBlock.h`)
+####  MemoryPool.h (原 SimpleMemoryBlock.h)
 
 ```c++
 #pragma once
@@ -539,7 +539,9 @@ private:
 };
 ```
 
-#### `MemoryPool.cpp` (原 `SimpleMemoryBlock.cpp`):
+
+
+####  (原 SimpleMemoryBlock.cpp):
 
 ```c++
 #include "MemoryPool.h"
@@ -873,6 +875,47 @@ pFreeList_ = nullptr;
 
 ### 四、实现精确内存对齐与调整槽管理逻辑
 
-- 实现 `padPointer` 类似的函数，确保从大内存块中划分出的第一个槽是正确对齐的。
+- **实现 `padPointer` 函数**：精确计算内存对齐所需的填充字节。
+- **调整 `MemoryPool` 的槽管理**：
+  - 将管理当前块内槽分配的指针（如 `pCurrentSlot_`）改为 `Slot*` 类型，并命名为 `curSlot_`。
+  - 将标记当前块内槽分配边界的指针（如 `pLastSlot_`）改为 `Slot*` 类型，并命名为 `lastSlot_`。
+  - 在 `allocateNewBlock()` 中使用 `padPointer` 初始化 `curSlot_`。
+  - 在 `allocate()` 方法中，使用 `curSlot_ += (slotSize_ / sizeof(Slot))` 的方式来移动指针。
 
-- 调整 `MemoryPool` 类中与槽分配相关的成员变量（如 `pCurrentSlot_`, `pLastSlot_`）的类型和逻辑，使其更接近你项目中 `curSlot_` (类型 `Slot*`) 和 `lastSlot_` (类型 `Slot*`) 的工作方式。
+#### 设计思路
+
+1. **`padPointer(char\* p, size_t align)` 函数**：
+
+- 输入：一个 `char*` 指针 `p` 和期望的对齐值 `align` (在我们的场景中，`align` 通常就是 `slotSize_`)。
+- 输出：需要填充多少字节 (`size_t`) 才能使 `p` 加上这些填充字节后的地址是 `align` 的整数倍。
+- 实现逻辑：`(align - (reinterpret_cast<uintptr_t>(p) % align)) % align`。
+  - `reinterpret_cast<uintptr_t>(p)`: 将指针转换为一个足够大的无符号整数类型，以便进行模运算。
+  - `% align`: 计算当前地址相对于对齐值的余数。
+  - `align -余数`: 计算还需要多少字节才能达到下一个对齐边界。
+  - 最外层的 `% align`: 处理当指针 `p` 已经是正确对齐的情况（此时余数为0，`align - 0 = align`，再 `% align` 结果为0，表示无需填充）。
+  - 你项目中 `padPointer` 的实现是 `(align - reinterpret_cast<size_t>(p)) % align`，这在 `align` 是2的幂次时是等价且更简洁的，我们也可以采用这种。`size_t` 通常等同于 `uintptr_t`。
+
+
+2. **`MemoryPool` 成员变量和逻辑调整**：
+
+- **`curSlot_` (原 `pCurrentSlot_`)**: 类型变为 `Slot*`。它指向当前大内存块中下一个可供分配的、已经正确对齐的槽的起始位置。
+
+- **`lastSlot_` (原 `pLastSlot_`)**: 类型变为 `Slot*`。它指向当前大内存块中最后一个可分配槽之后的位置（或者说，是一个哨兵，当 `curSlot_ >= lastSlot_` 时表示当前块已无槽可分配）。其计算方式要基于整个大块的结束地址和 `slotSize_`。
+
+- `allocateNewBlock()` 中的初始化：
+  - 获取新大块的起始地址 `newBlockStart` (`char*`)。
+  - 计算实际用于存储槽的内存区域的起始地址 `body = newBlockStart + sizeof(Slot*)` (跳过用于链接大块的头部指针)。
+  - 计算对齐所需的填充字节 `padding = padPointer(body, slotSize_)`。
+  - 初始化 `curSlot_ = reinterpret_cast<Slot*>(body + padding)`。
+  - 初始化 `lastSlot_ = reinterpret_cast<Slot*>(newBlockStart + blockSize_ - slotSize_ + 1)`。这里的 `blockSize_` 是整个大块的字节大小。这个 `lastSlot_` 的计算方式与你项目的原始逻辑一致。
+  
+- `allocate()` 中的指针移动：
+  - 当从当前块分配时，获取 `curSlot_` 作为返回值。
+  - 然后移动 `curSlot_`：`curSlot_ = curSlot_ + (slotSize_ / sizeof(Slot))`。这要求 `slotSize_` 必须是 `sizeof(Slot)` 的整数倍。由于 `Slot` 结构体（在我们的例子中）只包含一个指针，`sizeof(Slot)` 在64位系统上通常是8字节。`slotSize_` 通常也是8的倍数（如你项目中的 `SLOT_BASE_SIZE` 是8），所以这个条件一般会满足。
+
+#### MemoryPool.h 
+
+#### MemoryPool.cpp
+
+#### main.cpp
+
