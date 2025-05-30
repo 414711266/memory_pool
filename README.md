@@ -1244,4 +1244,12 @@ curSlot_ = reinterpret_cast<Slot*>(body + padding); // 对齐后的起始地址
 
 
 
-### 五、实现线程安全 (Part A) - 使用互斥锁保护关键区段
+### 五、实现线程安全 - 使用互斥锁保护关键区段
+
+- 在 `MemoryPool` 类中引入 `std::mutex` 成员（对应你项目中的 `mutexForBlock_`）。
+
+- 使用此互斥锁保护 `allocate()` 方法中从大块内存分配槽（即非 `pFreeList_` 分配路径）的逻辑，包括对 `allocateNewBlock()` 的调用。
+
+- 确保 `allocateNewBlock()` 中的操作由于被调用时已持有锁，从而受到保护。
+
+- 明确指出 `pFreeList_` 的操作（在 `allocate()` 的 `pFreeList_` 路径和 `deallocate()` 中）在这一步**仍然是线程不安全的**，将在后续步骤中用原子操作解决。
