@@ -541,7 +541,7 @@ private:
 
 
 
-####  (原 SimpleMemoryBlock.cpp):
+####  MemoryPool.cpp(原 SimpleMemoryBlock.cpp):
 
 ```c++
 #include "MemoryPool.h"
@@ -915,7 +915,333 @@ pFreeList_ = nullptr;
 
 #### MemoryPool.h 
 
+```c++
+#pragma once
+
+#include<iostream>
+#include <atomic>  // 为了将来引入原子操作，但暂时先用 FreeSlot*
+
+
+// 定义空闲节点的结构 (对应你项目中的 Slot)
+// 它既可以表示空闲链表中的一个槽，也可以用作大内存块链表的节点
+struct Slot {
+	Slot* pNext; // 指向下一个Slot (在空LE闲链表中) 或下一个大内存块
+};
+
+class MemoryPool
+{
+public:
+	// 构造时传入每个小块的固定大小 (slotSize) 和每个大块的大小 (blockSize)
+	MemoryPool() noexcept = default;
+	MemoryPool(size_t slotSize, size_t initialBlockSize = 4096);
+
+	~MemoryPool();
+
+	void* allocate(); // 不再传入size，因为slotSize是固定的
+	void deallocate(void* ptr); // 不再传入size
+
+	void init(size_t slotSize, size_t initialBlockSize); // 提供一个初始化方法
+private:
+	void allocateNewBlock(); // 申请新的大内存块
+
+	// 辅助函数：计算指针p为了对齐到align字节需要填充多少字节
+	static size_t padPointer(char* p, size_t align);
+
+	Slot* pHeadBlock_; //指向第一个大内存块的指针
+	Slot* curSlot_;        // 指向当前大内存块中下一个可分配的槽 (原 pCurrentSlot_)
+	Slot* lastSlot_;       // 指向当前大内存块中最后一个可分配槽的结束边界 (原 pLastSlot_)
+
+	Slot* pFreeList_;      // 指向空闲槽链表的头部
+
+	size_t slotSize_;      // 每个分配单元（槽）的大小
+	size_t blockSize_;     // 每个大内存块的大小
+};
+```
+
 #### MemoryPool.cpp
+
+```c++
+#include "MemoryPool.h"
+#include <cassert>
+// #include <new>
+
+MemoryPool::MemoryPool(size_t slotSize, size_t initialBlockSize)
+	: pHeadBlock_(nullptr),
+	curSlot_(nullptr),
+	lastSlot_(nullptr),
+	pFreeList_(nullptr),
+	slotSize_(0), // 将在 init 中设置
+	blockSize_(0)  // 将在 init 中设置
+{
+	init(slotSize, initialBlockSize);
+}
+
+void MemoryPool::init(size_t slotSize, size_t initialBlockSize)
+{
+	assert(slotSize >= sizeof(Slot) && "slotSize must be at least sizeof(Slot)");
+	// 如果使用 slotSize_ / sizeof(Slot) 这种算术，最好保证 slotSize_ 是 sizeof(Slot) 的整数倍
+	assert(slotSize % sizeof(Slot) == 0 && "slotSize must be a multiple of sizeof(Slot)");
+	assert(initialBlockSize > sizeof(Slot) && "initialBlockSize too small");
+
+	slotSize_ = slotSize;
+	blockSize_ = initialBlockSize;
+
+	pHeadBlock_ = nullptr;
+	curSlot_ = nullptr; // 修改
+	lastSlot_ = nullptr; // 修改
+	pFreeList_ = nullptr;
+
+	std::cout << "MemoryPool: 初始化完成。槽大小: " << slotSize_
+		<< " 字节, 大块大小: " << blockSize_ << " 字节。" << std::endl;
+}
+
+
+
+MemoryPool::~MemoryPool()
+{
+	Slot* currentBlock = pHeadBlock_;
+	while (currentBlock != nullptr) {
+		Slot* nextBlock = currentBlock->pNext; // 每个大块的头部被用作Slot来链接下一个大块
+		operator delete(reinterpret_cast<void*>(currentBlock)); // 释放大块内存
+		currentBlock = nextBlock;
+	}
+	std::cout << "MemoryPool: 所有内存块已释放。" << std::endl;
+}
+
+// 实现 padPointer 静态方法
+size_t MemoryPool::padPointer(char* p, size_t align) {
+	// 使用 uintptr_t 来确保整数类型足够大以存储指针的数值
+	uintptr_t address = reinterpret_cast<uintptr_t>(p);
+	// (align - address % align) % align 是一种常见的计算padding的方法
+	// 如果 address % align 为0 (已对齐), (align - 0) % align = 0.
+	// 否则, align - (address % align) 就是到下一个对齐点的距离.
+	return (align - (address % align)) % align;
+	// 你项目中的实现是 (align - reinterpret_cast<size_t>(p)) % align
+	// 在大多数情况下，size_t 和 uintptr_t 可以互换用于指针到整数的转换
+	// 我们这里用 uintptr_t 更明确其意图。
+}
+
+void MemoryPool::allocateNewBlock()
+{
+	// 1. 申请新的大块内存
+	//    注意：operator new 只分配内存，不调用构造函数
+	char* newBlockStart = reinterpret_cast<char*>(operator new(blockSize_));
+	if (newBlockStart == nullptr) {
+		std::cerr << "MemoryPool: allocateNewBlock 失败，无法分配新的大块内存 (" << blockSize_ << " 字节)。" << std::endl;
+		// 实际应用中应该抛出 std::bad_alloc 或者有其他错误处理
+		return;
+	}
+	std::cout << "MemoryPool: 成功申请新的大内存块，地址: " << static_cast<void*>(newBlockStart) << std::endl;
+
+	// 2. 将新块头插到 pHeadBlock_ 链表中
+	Slot* newBlockHeader = reinterpret_cast<Slot*>(newBlockStart);
+	newBlockHeader->pNext = pHeadBlock_;
+	pHeadBlock_ = newBlockHeader;
+
+
+	// 计算实际用于槽分配的内存区域的起始点 (body)
+	// 大块的头部 sizeof(Slot) 字节被用于链接 (newBlockHeader->pNext)
+	char* body = newBlockStart + sizeof(Slot); // 注意这里是 sizeof(Slot) 不是 sizeof(Slot*)
+											   // 因为 Slot 结构体目前只有一个 Slot* pNext 成员
+											   // 如果 Slot 结构体变复杂，这里要用 sizeof(Slot)
+
+
+	// 计算对齐所需的填充字节
+	size_t padding = padPointer(body, slotSize_);
+
+	// 初始化 curSlot_，它指向第一个正确对齐的槽
+	curSlot_ = reinterpret_cast<Slot*>(body + padding);
+
+	// 初始化 lastSlot_，计算方式与你项目一致
+	// 它指向最后一个可分配槽之后的位置（或一个理论上的哨兵）
+	// newBlockStart + blockSize_ 是整个大块的末尾的下一个字节
+	// 从末尾回退 slotSize_ 就是最后一个槽的起始位置 (如果完美分割)
+	// +1 是因为比较通常是 curSlot_ < lastSlot_ 或 curSlot_ >= lastSlot_
+	lastSlot_ = reinterpret_cast<Slot*>(newBlockStart + blockSize_ - slotSize_ + 1);
+
+	// 我们仍然选择暂时不在这里清空 pFreeList_，原因同上一步讨论。
+	// pFreeList_ = nullptr;
+
+	// 调试输出，看看对齐后的curSlot_ 和 lastSlot_
+	 //std::cout << "  New block: body at " << static_cast<void*>(body)
+	 //          << ", padding " << padding
+	 //          << ", curSlot_ at " << static_cast<void*>(curSlot_)
+	 //          << ", lastSlot_ at " << static_cast<void*>(lastSlot_) << std::endl;
+	 //std::cout << "  (curSlot_ as int: " << reinterpret_cast<uintptr_t>(curSlot_)
+	 //          << ", lastSlot_ as int: " << reinterpret_cast<uintptr_t>(lastSlot_) << ")" << std::endl;
+}
+
+void* MemoryPool::allocate()
+{
+	// 1. 优先从空闲链表分配
+	if (pFreeList_ != nullptr) {
+		void* memory = static_cast<void*>(pFreeList_);
+		pFreeList_ = pFreeList_->pNext; // 移动空闲链表头指针
+		// std::cout << "SimpleMemoryBlock: 从空闲链表分配了 " << slotSize_ << " 字节。" << std::endl;
+		return memory;
+	}
+
+	// 2. 空闲链表为空，则从大块内存中分配
+	//    首先检查是否需要分配新的大块 (pCurrentSlot_ 为 nullptr 或者已超出当前块的范围)
+	if (curSlot_ == nullptr || curSlot_ >= lastSlot_) { // curSlot_ 可能因为 allocateNewBlock 失败仍为 nullptr
+		allocateNewBlock();
+		// 如果 allocateNewBlock 失败 (比如系统内存耗尽)，pCurrentSlot_ 可能仍然不合法
+		if (curSlot_ == nullptr || curSlot_ >= lastSlot_) {  // 再次检查，如果新块分配失败或新块太小
+			std::cout << "MemoryPool: 内存严重不足，无法从新的大块中分配。" << std::endl;
+			return nullptr;
+		}
+	}
+
+	Slot* allocatedSlot = curSlot_;
+
+	// 移动 curSlot_ 到下一个槽的位置
+	// 这里的算术是基于 Slot* 类型的指针算术
+	// curSlot_ + N 会使指针前进 N * sizeof(Slot) 字节
+	// 我们希望前进 slotSize_ 字节。
+	// 所以需要前进 slotSize_ / sizeof(Slot) 个 Slot 单元
+	curSlot_ = curSlot_ + (slotSize_ / sizeof(Slot)); // (类似逻辑)
+
+	return static_cast<void*>(allocatedSlot);
+}
+
+void MemoryPool::deallocate(void* ptr) 
+{
+	if (ptr == nullptr) {
+		return;
+	}
+	Slot* releasedSlot = static_cast<Slot*>(ptr);
+	releasedSlot->pNext = pFreeList_;
+	pFreeList_ = releasedSlot;
+	// std::cout << "MemoryPool: 回收了 " << slotSize_ << " 字节到空闲链表。" << std::endl;
+}
+
+```
 
 #### main.cpp
 
+```C++
+// 预先向系统申请一大片内存，并交由应用层管理，在程序运行时，
+// 内存的分配和回收都由应用层的内存池处理，从而减少系统调用。
+// 2025年5月24日22:30:30
+
+#include <iostream>
+#include <vector>
+#include "MemoryPool.h"
+
+struct MyFixedSizeData {
+    int id;
+    char data[12]; // 假设 MyFixedSizeData 大小为 16 字节 (int:4 + char[12]:12)
+                   // 或者为了确保至少能放下 FreeSlot*，我们可以调整
+                   // 如果 FreeSlot* 是8字节，那么char data[8] 即可使总大小为16
+};
+const size_t FIXED_DATA_SIZE = sizeof(MyFixedSizeData);
+
+
+int main()
+{
+    // 假设 FreeSlot* 是 8 字节，MyFixedSizeData 是 16 字节
+    // 我们创建一个内存池，每个槽16字节，总共能放比如 5 个这样的对象 (16 * 5 = 80 字节)
+    // 为了测试方便，我们让 slotSize 直接等于 FIXED_DATA_SIZE
+    // 但要确保 FIXED_DATA_SIZE >= sizeof(FreeSlot)
+    if (FIXED_DATA_SIZE < sizeof(Slot)) {
+        std::cerr << "错误: MyFixedSizeData (" << FIXED_DATA_SIZE
+            << " bytes) 太小，无法容纳 Slot* (" << sizeof(Slot)
+            << " bytes)." << std::endl;
+        return 1;
+    }
+
+    // 每个槽 16 字节。每个大块设计得只能放很少的槽，比如 3 个槽 + 1个Slot头指针(假设8字节)
+    // blockSize = sizeof(Slot*) (用于链接块) + 3 * FIXED_DATA_SIZE
+    // 假设 sizeof(Slot*) = 8 字节, FIXED_DATA_SIZE = 16 字节
+    // blockSize = 8 + 3 * 16 = 8 + 48 = 56 字节。 我们取一个近似值，比如64字节，确保能放下。
+    // 或者更直接地，blockSize 至少要大于 sizeof(Slot*) + slotSize_
+    size_t testSlotSize = FIXED_DATA_SIZE;
+    size_t testBlockSize = sizeof(Slot*) + testSlotSize * 3; // 确保能放3个我们自定义的槽和1个链接头
+
+    std::cout << "测试参数：Slot大小=" << testSlotSize << ", Block大小=" << testBlockSize << std::endl;
+    std::cout << "(一个Block理论上可以存放 " << (testBlockSize - sizeof(Slot*)) / testSlotSize << " 个Slot)" << std::endl;
+
+    MemoryPool pool(testSlotSize, testBlockSize);
+
+    std::vector<MyFixedSizeData*> allocatedObjects;
+
+    // 阶段1: 尝试分配多个对象，预期会触发 allocateNewBlock
+    std::cout << "\n--- 阶段1: 持续分配，测试动态扩容 ---" << std::endl;
+    for (int i = 0; i < 10; ++i) { // 尝试分配10个对象
+        MyFixedSizeData* obj = static_cast<MyFixedSizeData*>(pool.allocate());
+        if (obj) {
+            obj->id = i + 1;
+            snprintf(obj->data, sizeof(obj->data), "Obj%d", obj->id);
+            allocatedObjects.push_back(obj);
+            std::cout << "分配: ID " << obj->id << " (" << obj->data << ") at " << obj
+                << " (addr_val: " << reinterpret_cast<uintptr_t>(obj) << ")" << std::endl; // 打印地址的整数值
+        }
+        else {
+            std::cout << "分配失败！尝试分配第 " << (i + 1) << " 个对象时内存不足。" << std::endl;
+            break;
+        }
+    }
+
+    std::cout << "\n当前已分配对象数量: " << allocatedObjects.size() << std::endl;
+
+    // 阶段2: 释放一些对象
+    std::cout << "\n--- 阶段2: 释放部分对象 ---" << std::endl;
+    if (allocatedObjects.size() > 4) { // 确保有足够的对象可以释放
+        MyFixedSizeData* objToFree1 = allocatedObjects[1]; // 释放第2个
+        MyFixedSizeData* objToFree2 = allocatedObjects[3]; // 释放第4个
+        std::cout << "准备释放: ID " << objToFree1->id << " at " << objToFree1 << std::endl;
+        pool.deallocate(objToFree1);
+        std::cout << "准备释放: ID " << objToFree2->id << " at " << objToFree2 << std::endl;
+        pool.deallocate(objToFree2);
+    }
+
+    // 阶段3: 尝试重新分配，看是否能复用，以及是否能继续从新块分配
+    std::cout << "\n--- 阶段3: 尝试重新分配 ---" << std::endl;
+    for (int i = 0; i < 5; ++i) { // 尝试再分配5个
+        MyFixedSizeData* obj = static_cast<MyFixedSizeData*>(pool.allocate());
+        if (obj) {
+            obj->id = 100 + i;
+            snprintf(obj->data, sizeof(obj->data), "ReObj%d", obj->id);
+            std::cout << "重新分配: ID " << obj->id << " (" << obj->data << ") at " << obj
+                << " (addr_val: " << reinterpret_cast<uintptr_t>(obj) << ")" << std::endl; // 打印地址的整数值
+        }
+        else {
+            std::cout << "重新分配失败！尝试第 " << (i + 1) << " 次重新分配时内存不足。" << std::endl;
+            break;
+        }
+    }
+
+    std::cout << "\n--- 测试结束 ---" << std::endl;
+    // 清理: 在实际应用中，如果 allocatedObjects 中的对象不再需要，应逐个 deallocate
+    // 但由于 pool 析构时会释放所有大块，这里的内存不会泄露 (但对象析构未调用)
+    // 为了简单，我们暂时不手动 deallocate allocatedObjects 中的所有剩余对象
+    return 0;
+}
+```
+
+#### 内存对齐
+
+通过计算对齐偏移量实现内存对齐，此处使用静态方法。
+
+```c++
+static size_t padPointer(char* p, size_t align) {
+    uintptr_t address = reinterpret_cast<uintptr_t>(p);
+    return (align - (address % align)) % align;
+}
+```
+
+- **原理** ：通过取模运算计算当前地址对齐到 `align` 的偏移量。例如，若 `align=8`，地址 `0x1004` 的偏移量为 `4`，填充后地址变为 `0x1008`。
+- **调整起始地址** ：在 `allocateNewBlock` 函数中，计算对齐后的起始地址：
+
+```c++
+// 计算对齐后的起始地址
+char* body = newBlockStart + sizeof(Slot); // 大块内存的头部保留 sizeof(Slot) 空间
+size_t padding = padPointer(body, slotSize_);
+curSlot_ = reinterpret_cast<Slot*>(body + padding); // 对齐后的起始地址
+```
+
+- **目的** ：确保 `curSlot_` 的地址对齐到 `slotSize_` 的边界。
+
+
+
+### 五、实现线程安全 (Part A) - 使用互斥锁保护关键区段
