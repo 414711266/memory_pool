@@ -908,7 +908,7 @@ pFreeList_ = nullptr;
   - 计算对齐所需的填充字节 `padding = padPointer(body, slotSize_)`。
   - 初始化 `curSlot_ = reinterpret_cast<Slot*>(body + padding)`。
   - 初始化 `lastSlot_ = reinterpret_cast<Slot*>(newBlockStart + blockSize_ - slotSize_ + 1)`。这里的 `blockSize_` 是整个大块的字节大小。这个 `lastSlot_` 的计算方式与你项目的原始逻辑一致。
-  
+
 - `allocate()` 中的指针移动：
   - 当从当前块分配时，获取 `curSlot_` 作为返回值。
   - 然后移动 `curSlot_`：`curSlot_ = curSlot_ + (slotSize_ / sizeof(Slot))`。这要求 `slotSize_` 必须是 `sizeof(Slot)` 的整数倍。由于 `Slot` 结构体（在我们的例子中）只包含一个指针，`sizeof(Slot)` 在64位系统上通常是8字节。`slotSize_` 通常也是8的倍数（如你项目中的 `SLOT_BASE_SIZE` 是8），所以这个条件一般会满足。
@@ -1253,3 +1253,316 @@ curSlot_ = reinterpret_cast<Slot*>(body + padding); // 对齐后的起始地址
 - 确保 `allocateNewBlock()` 中的操作由于被调用时已持有锁，从而受到保护。
 
 - 明确指出 `pFreeList_` 的操作（在 `allocate()` 的 `pFreeList_` 路径和 `deallocate()` 中）在这一步**仍然是线程不安全的**，将在后续步骤中用原子操作解决。
+
+#### MemoryPool.h 
+
+```c++
+#pragma once
+
+#include<iostream>
+#include <atomic>  // 为了将来引入原子操作，但暂时先用 FreeSlot*
+#include <mutex>     // <<< 新增：为了 std::mutex 和 std::lock_guard
+#include <thread>    // <<< 新增：为了 std::this_thread::get_id() (调试用)
+
+// 定义空闲节点的结构 (对应你项目中的 Slot)
+// 它既可以表示空闲链表中的一个槽，也可以用作大内存块链表的节点
+struct Slot {
+	Slot* pNext; // 指向下一个Slot (在空LE闲链表中) 或下一个大内存块
+};
+
+class MemoryPool
+{
+public:
+	// 构造时传入每个小块的固定大小 (slotSize) 和每个大块的大小 (blockSize)
+	MemoryPool() noexcept = default;
+	MemoryPool(size_t slotSize, size_t initialBlockSize = 4096);
+
+	~MemoryPool();
+
+	void* allocate(); // 不再传入size，因为slotSize是固定的
+	void deallocate(void* ptr); // 不再传入size
+
+	void init(size_t slotSize, size_t initialBlockSize); // 提供一个初始化方法
+private:
+	void allocateNewBlock(); // 申请新的大内存块
+
+	// 辅助函数：计算指针p为了对齐到align字节需要填充多少字节
+	static size_t padPointer(char* p, size_t align);
+
+	Slot* pHeadBlock_; //指向第一个大内存块的指针
+	Slot* curSlot_;        // 指向当前大内存块中下一个可分配的槽 (原 pCurrentSlot_)
+	Slot* lastSlot_;       // 指向当前大内存块中最后一个可分配槽的结束边界 (原 pLastSlot_)
+
+	Slot* pFreeList_;      // 指向空闲槽链表的头部，此链表的操作在这一步中仍然是非线程安全的
+
+	size_t slotSize_;      // 每个分配单元（槽）的大小
+	size_t blockSize_;     // 每个大内存块的大小
+
+	std::mutex mutexForBlock_; //新增：用于保护大块分配和相关指针
+};
+```
+
+#### MemoryPool.cpp
+
+```c++
+#include "MemoryPool.h"
+#include <cassert>
+// #include <new>
+
+MemoryPool::MemoryPool(size_t slotSize, size_t initialBlockSize)
+	: pHeadBlock_(nullptr),
+	curSlot_(nullptr),
+	lastSlot_(nullptr),
+	pFreeList_(nullptr),
+	slotSize_(0), // 将在 init 中设置
+	blockSize_(0)  // 将在 init 中设置
+	// this->mutexForBlock_() // 默认构造即可
+{
+	this->init(slotSize, initialBlockSize);
+}
+
+void MemoryPool::init(size_t slotSize, size_t initialBlockSize)
+{
+	assert(slotSize >= sizeof(Slot) && "slotSize must be at least sizeof(Slot)");
+	// 如果使用 slotSize_ / sizeof(Slot) 这种算术，最好保证 slotSize_ 是 sizeof(Slot) 的整数倍
+	assert(slotSize % sizeof(Slot) == 0 && "slotSize must be a multiple of sizeof(Slot)");
+	assert(initialBlockSize > sizeof(Slot) && "initialBlockSize too small");
+
+	this->slotSize_ = slotSize;
+	this->blockSize_ = initialBlockSize;
+
+	this->pHeadBlock_ = nullptr;
+	this->curSlot_ = nullptr;
+	this->lastSlot_ = nullptr;
+	this->pFreeList_ = nullptr;
+	this->pFreeList_ = nullptr;
+
+	std::cout << "MemoryPool: 初始化完成。槽大小: " << this->slotSize_
+		<< " 字节, 大块大小: " << this->blockSize_ << " 字节。" << std::endl;
+}
+
+
+
+MemoryPool::~MemoryPool() {
+	Slot* currentBlock = this->pHeadBlock_;
+	while (currentBlock != nullptr) {
+		Slot* nextBlock = currentBlock->pNext;
+		operator delete(reinterpret_cast<void*>(currentBlock));
+		currentBlock = nextBlock;
+	}
+	std::cout << "MemoryPool: 所有内存块已释放。" << std::endl;
+}
+
+// 实现 padPointer 静态方法
+size_t MemoryPool::padPointer(char* p, size_t align) {
+	// 使用 uintptr_t 来确保整数类型足够大以存储指针的数值
+	uintptr_t address = reinterpret_cast<uintptr_t>(p);
+	return (align - (address % align)) % align;
+}
+
+// allocateNewBlock 方法本身不需要再加锁，因为它将被 allocate() 在持有锁的情况下调用
+void MemoryPool::allocateNewBlock()
+{
+	char* newBlockStart = reinterpret_cast<char*>(operator new(this->blockSize_));
+	if (newBlockStart == nullptr) {
+		// 在持有锁的情况下，如果分配失败，需要一种方式通知调用者
+		// 这里简单打印错误，实际可能需要抛出异常或返回状态
+		std::cerr << "MemoryPool: (线程 " << std::this_thread::get_id() << ") allocateNewBlock 失败，无法分配大块内存 (" << this->blockSize_ << " 字节)。" << std::endl;
+		// curSlot_ 和 lastSlot_ 保持不变或设置为无效状态，使得 allocate() 后续逻辑能识别失败
+		return;
+	}
+	// std::cout << "MemoryPool: (线程 " << std::this_thread::get_id() << ") 成功申请新大块内存，地址: " << static_cast<void*>(newBlockStart) << std::endl;
+
+	// 2. 将新块头插到 pHeadBlock_ 链表中
+	Slot* newBlockHeader = reinterpret_cast<Slot*>(newBlockStart);
+	newBlockHeader->pNext = this->pHeadBlock_;
+	this->pHeadBlock_ = newBlockHeader;
+
+
+	// 计算实际用于槽分配的内存区域的起始点 (body)
+	// 大块的头部 sizeof(Slot) 字节被用于链接 (newBlockHeader->pNext)
+	char* body = newBlockStart + sizeof(Slot);
+	size_t padding = MemoryPool::padPointer(body, this->slotSize_);
+
+	this->curSlot_ = reinterpret_cast<Slot*>(body + padding);
+	this->lastSlot_ = reinterpret_cast<Slot*>(newBlockStart + this->blockSize_ - this->slotSize_ + 1);
+}
+
+void* MemoryPool::allocate() {
+	// 步骤 1: 尝试从 pFreeList_ 分配 (当前仍然是线程不安全的!)
+	// 我们将在下一步使用原子操作来改进 pFreeList_
+	// !! 警告：以下对 pFreeList_ 的操作不是线程安全的 !!
+	// !! 如果多个线程几乎同时检查到 pFreeList_ 非空，它们可能尝试获取同一个 slot !!
+	if (this->pFreeList_ != nullptr) {
+		// 为了演示，我们先简单移出，但在多线程下这里是危险区
+		// 一个简单的（但不完全解决ABA问题的）尝试性保护是再次检查
+		Slot* head = this->pFreeList_; // 读一次
+		if (head != nullptr) { // 再次检查
+			// 仍然有问题：两个线程可能都读到同一个 head
+			// 假设线程A读到head，线程B也读到同一个head
+			// 线程A更新 this->pFreeList_ = head->pNext
+			// 线程B也更新 this->pFreeList_ = head->pNext (如果head->pNext没变，可能导致重复释放或逻辑错误)
+			// 或者线程A拿到head，被切换，线程B拿到head并更新pFreeList，然后线程A再更新pFreeList就会出错
+			// ====> 真正的无锁链表操作比这复杂得多，这里只是指出问题。
+			// ====> 在这一版，我们“假设”单线程会先到这里，或者接受这里的风险直到下一步修复。
+			// ====> 更安全的做法是在这一步也将 pFreeList 的操作也用 mutexForBlock_ 保护起来，
+			// ====> 但为了逐步演进到你项目的原子操作 freeList_，我们暂时不这么做。
+
+			// void* memory = static_cast<void*>(this->pFreeList_);
+			// this->pFreeList_ = this->pFreeList_->pNext;
+			// return memory;
+			// ** 鉴于上述风险，且为了与下一步原子操作 freeList 对比，
+			// ** 暂时注释掉直接从 pFreeList 分配的逻辑，强制所有分配走加锁路径，
+			// ** 直到实现原子的 pushFreeList/popFreeList。
+			// ** 或者，我们保留它，但强调其不安全性。
+			// ** 你的项目是先 popFreeList (原子)，不行再加锁分配block。我们就按这个逻辑。
+			// ** 所以，这一行现在是“理论上存在，但实际上不安全，等待下一步的原子化改造”。
+		}
+	}
+
+	// 步骤 2: 从大块内存分配，这部分需要加锁
+	{ // 创建作用域，用于 std::lock_guard
+		//自动加锁与解锁 ：在进入代码块时自动锁定 mutexForBlock_，在离开作用域时自动释放锁。
+		std::lock_guard<std::mutex> lock(this->mutexForBlock_);
+
+		// 在锁内再次检查 pFreeList_ (如果上面的非安全检查拿到了，这里可以跳过)
+		// 但因为我们目标是模仿你项目的：先原子pop，不行再锁住分配大块。
+		// 所以这里假设如果能原子pop，就不会进入这个锁来分配。
+		// 如果进入这个锁，说明原子pop失败(或我们还没实现原子pop)。
+		// 因此，这里还是主要处理从curSlot_分配的逻辑。
+
+		if (this->curSlot_ == nullptr || this->curSlot_ >= this->lastSlot_) {
+			this->allocateNewBlock();
+			// 检查 allocateNewBlock 是否成功 (比如 newBlockStart 分配失败导致 curSlot_ 未更新)
+			if (this->curSlot_ == nullptr || this->curSlot_ >= this->lastSlot_) {
+				std::cerr << "MemoryPool: (线程 " << std::this_thread::get_id() << ") 内存严重不足，allocateNewBlock后仍无法分配。" << std::endl;
+				return nullptr; // 释放锁并返回
+			}
+		}
+
+		Slot* allocatedSlot = this->curSlot_;
+		this->curSlot_ = this->curSlot_ + (this->slotSize_ / sizeof(Slot));
+		// std::cout << "MemoryPool: (线程 " << std::this_thread::get_id() << ") 从主块分配于 " << static_cast<void*>(allocatedSlot) << std::endl;
+		return static_cast<void*>(allocatedSlot);
+	} // lock_guard 在此析构，互斥锁被释放
+}
+
+// deallocate 方法在这一步仍然是线程不安全的
+void MemoryPool::deallocate(void* ptr) {
+	if (ptr == nullptr) {
+		return;
+	}
+	// !! 警告：以下对 pFreeList_ 的操作不是线程安全的 !!
+	Slot* releasedSlot = static_cast<Slot*>(ptr);
+	releasedSlot->pNext = this->pFreeList_;
+	this->pFreeList_ = releasedSlot;
+	// std::cout << "MemoryPool: (线程 " << std::this_thread::get_id() << ") 回收 " << static_cast<void*>(ptr) << " 到pFreeList (非线程安全)" << std::endl;
+}
+```
+
+#### main.cpp
+
+```c++
+// 预先向系统申请一大片内存，并交由应用层管理，在程序运行时，
+// 内存的分配和回收都由应用层的内存池处理，从而减少系统调用。
+// 2025年5月24日22:30:30
+
+#include <iostream>
+#include <vector>
+#include "MemoryPool.h"
+#include <thread>    // For std::thread
+#include <atomic>    // For std::atomic_size_t (可选，用于计数)
+#include <cassert>
+
+struct MyFixedSizeData {
+    int id;
+    char data[12]; // 直接固定为 12，确保总大小为 16 字节
+};//sizeof(Slot): 4
+
+const size_t FIXED_DATA_SIZE = sizeof(MyFixedSizeData);
+
+// 全局内存池实例
+MemoryPool g_pool(FIXED_DATA_SIZE, FIXED_DATA_SIZE * 3 + sizeof(Slot)); // 每个大块能放约3个对象
+
+// 在多线程环境下，多个线程可能同时修改计数器。使用 std::atomic 可以确保对计数器的读写操作是原子的
+std::atomic<size_t> g_alloc_count(0);  // 原子计数器：成功分配的次数
+std::atomic<size_t> g_fail_count(0);   // 原子计数器：分配失败的次数
+
+void worker_thread_func(int thread_id, int num_allocs) {
+    std::cout << "线程 " << thread_id << " 开始执行。" << std::endl;
+    std::vector<void*> allocated_pointers;
+    allocated_pointers.reserve(num_allocs);
+
+    for (int i = 0; i < num_allocs; ++i) {
+        void* p = g_pool.allocate();
+        if (p) {
+            allocated_pointers.push_back(p);
+            g_alloc_count++;
+            // 可以在这里尝试写入一些数据，但要小心，因为对象可能很快被其他线程回收和重用（如果deallocate也并发）
+            // MyFixedSizeData* data = static_cast<MyFixedSizeData*>(p);
+            // data->id = thread_id * 1000 + i;
+        }
+        else {
+            g_fail_count++;
+            // std::cout << "线程 " << thread_id << " 分配失败次序: " << i << std::endl;
+        }
+        // 可以选择性地加入少量休眠，以增加线程交错的可能性
+        // std::this_thread::sleep_for(std::chrono::microseconds(1));
+    }
+
+    // 暂时不并发 deallocate，因为 deallocate 和 pFreeList 的 allocate 路径还未线程安全
+    // for (void* p : allocated_pointers) {
+    //    g_pool.deallocate(p);
+    // }
+    // std::cout << "线程 " << thread_id << " 执行完毕，分配了 " << allocated_pointers.size() << " 个对象。" << std::endl;
+}
+
+int main() {
+    const int num_threads = 4; // 例如4个线程
+    const int allocs_per_thread = 20; // 每个线程分配20次
+
+    std::cout << "MemoryPool 测试 (第五步：部分线程安全 - 锁保护大块分配)" << std::endl;
+    std::cout << "sizeof(MyFixedSizeData): " << sizeof(MyFixedSizeData) << ", sizeof(Slot): " << sizeof(Slot) << std::endl;
+    assert(FIXED_DATA_SIZE >= sizeof(Slot));
+    assert(FIXED_DATA_SIZE % sizeof(Slot) == 0);
+
+
+    std::vector<std::thread> threads;
+    // 预先分配空间，避免动态扩容。
+    threads.reserve(num_threads);
+
+    std::cout << "启动 " << num_threads << " 个线程, 每个线程尝试分配 " << allocs_per_thread << " 次..." << std::endl;
+
+    for (int i = 0; i < num_threads; ++i) {
+        //为每个线程创建并启动 worker_thread_func 
+        threads.emplace_back(worker_thread_func, i + 1, allocs_per_thread);
+    }
+
+    for (std::thread& t : threads) {
+        //判断线程是否处于可加入状态（即线程已启动且未被 join 或 detach 过）
+        if (t.joinable()) {
+            //阻塞当前线程（主函数），直到目标线程 t 执行完毕
+            t.join();
+        }
+    }
+
+    std::cout << "\n--- 测试完成 ---" << std::endl;
+    std::cout << "总成功分配次数: " << g_alloc_count.load() << std::endl;
+    std::cout << "总分配失败次数: " << g_fail_count.load() << std::endl;
+    std::cout << "预期总请求次数: " << num_threads * allocs_per_thread << std::endl;
+
+    // 注意：此时g_pool析构时会释放所有大块内存。
+    // 如果在 worker_thread_func 中分配后没有保存指针并在main中deallocate，
+    // 那么这些内存仅被逻辑上“占用”，直到池析构。
+    // 由于我们注释了并发deallocate，所以这里主要是测试allocate路径的线程安全性。
+    return 0;
+}
+```
+
+对`allocate()`过程进行加锁，此时pFreeList_还未进行原子操作，故注释相关代码，
+
+```c++
+std::lock_guard<std::mutex> lock(this->mutexForBlock_);
+```
+
+在进入代码块时自动锁定 `mutexForBlock_`，在离开作用域时自动释放锁。
