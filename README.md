@@ -1246,11 +1246,11 @@ curSlot_ = reinterpret_cast<Slot*>(body + padding); // 对齐后的起始地址
 
 ### 五、实现线程安全 - 使用互斥锁保护关键区段
 
-- 在 `MemoryPool` 类中引入 `std::mutex` 成员（对应你项目中的 `mutexForBlock_`）。
+- 在 `MemoryPool` 类中引入 `std::mutex` 成员（对应项目中的 `mutexForBlock_`）。
 
 - 使用此互斥锁保护 `allocate()` 方法中从大块内存分配槽（即非 `pFreeList_` 分配路径）的逻辑，包括对 `allocateNewBlock()` 的调用。
 
-- 确保 `allocateNewBlock()` 中的操作由于被调用时已持有锁，从而受到保护。
+- 确保 `allocateNewBlock()` 中的操作由于被调用时已持有锁，从而受到保护。`this->allocateNewBlock()` 方法本身虽然没有直接加锁，但因为它总是在 `allocate()` 方法已获取 `this->mutexForBlock_` 的情况下被调用，所以其内部对共享资源的修改也受到了保护。
 
 - 明确指出 `pFreeList_` 的操作（在 `allocate()` 的 `pFreeList_` 路径和 `deallocate()` 中）在这一步**仍然是线程不安全的**，将在后续步骤中用原子操作解决。
 
@@ -1334,7 +1334,6 @@ void MemoryPool::init(size_t slotSize, size_t initialBlockSize)
 	this->pHeadBlock_ = nullptr;
 	this->curSlot_ = nullptr;
 	this->lastSlot_ = nullptr;
-	this->pFreeList_ = nullptr;
 	this->pFreeList_ = nullptr;
 
 	std::cout << "MemoryPool: 初始化完成。槽大小: " << this->slotSize_
@@ -1566,3 +1565,16 @@ std::lock_guard<std::mutex> lock(this->mutexForBlock_);
 ```
 
 在进入代码块时自动锁定 `mutexForBlock_`，在离开作用域时自动释放锁。
+
+
+
+### 六、实现线程安全 - 原子操作的 `freeList_`
+
+2025年6月7日23:40:46已实现，代码以跑通，文档还未开始写，有部分问题需要解决。
+
+
+
+
+
+
+
