@@ -1570,11 +1570,390 @@ std::lock_guard<std::mutex> lock(this->mutexForBlock_);
 
 ### 六、实现线程安全 - 原子操作的 `freeList_`
 
-2025年6月7日23:40:46已实现，代码以跑通，文档还未开始写，有部分问题需要解决。
+#### MemoryPool.h 
+
+```c++
+#pragma once
+
+#include<iostream>
+#include <atomic>  // 为了将来引入原子操作，但暂时先用 FreeSlot*
+#include <mutex>     // <<< 新增：为了 std::mutex 和 std::lock_guard
+#include <thread>    // <<< 新增：为了 std::this_thread::get_id() (调试用)
+
+struct Slot {
+	// 在无锁链表中，Slot的next指针也可能需要是原子的，
+	// 或者其访问和修改需要非常小心。
+	// 多线程环境下的链表操作需要原子性 
+	std::atomic<Slot*> pNext; // 修改为原子类型
+};
+
+class MemoryPool
+{
+public:
+	// 构造时传入每个小块的固定大小 (slotSize) 和每个大块的大小 (blockSize)
+	MemoryPool() noexcept = default;
+	MemoryPool(size_t slotSize, size_t initialBlockSize = 4096);
+
+	~MemoryPool();
+
+	void* allocate(); // 不再传入size，因为slotSize是固定的
+	void deallocate(void* ptr); // 不再传入size
+
+	void init(size_t slotSize, size_t initialBlockSize); // 提供一个初始化方法
+private:
+	void allocateNewBlock(); // 申请新的大内存块
+
+	// 辅助函数：计算指针p为了对齐到align字节需要填充多少字节
+	static size_t padPointer(char* p, size_t align);
+
+	// 原子操作的空闲链表
+	// 将一个空闲槽（slot）原子地推入空闲链表头部。
+	bool pushFreeList(Slot* slot);
+	// 原子地弹出空闲链表头部节点。
+	Slot* popFreeList();
+
+	Slot* pHeadBlock_;     //指向第一个大内存块的指针
+	Slot* curSlot_;        // 指向当前大内存块中下一个可分配的槽 (原 pCurrentSlot_)
+	Slot* lastSlot_;       // 指向当前大内存块中最后一个可分配槽的结束边界 (原 pLastSlot_)
+
+	// Slot* pFreeList_; // <<< 移除旧的非原子链表头
+	//多线程可能同时修改 atomicFreeList_（如 pushFreeList 和 popFreeList）。
+	std::atomic<Slot*> atomicFreeList_; // 新增：原子类型的空闲链表头
+
+	size_t slotSize_;      // 每个分配单元（槽）的大小
+	size_t blockSize_;     // 每个大内存块的大小
+
+	std::mutex mutexForBlock_; //新增：用于保护大块分配和相关指针
+};
+```
+
+#### MemoryPool.cpp
+```c++
+#include "MemoryPool.h"
+#include <cassert>
+// #include <new>
+
+MemoryPool::MemoryPool(size_t slotSize, size_t initialBlockSize)
+	: pHeadBlock_(nullptr),
+	curSlot_(nullptr),
+	lastSlot_(nullptr),
+	atomicFreeList_(nullptr), // 初始化原子变量
+	slotSize_(0), // 将在 init 中设置
+	blockSize_(0)  // 将在 init 中设置
+	// this->mutexForBlock_() // 默认构造即可
+{
+	this->init(slotSize, initialBlockSize);
+}
+
+void MemoryPool::init(size_t slotSize, size_t initialBlockSize)
+{
+	assert(slotSize >= sizeof(Slot) && "slotSize must be at least sizeof(Slot)");
+	// 如果使用 slotSize_ / sizeof(Slot) 这种算术，最好保证 slotSize_ 是 sizeof(Slot) 的整数倍
+	assert(slotSize % sizeof(Slot) == 0 && "slotSize must be a multiple of sizeof(Slot)");
+	assert(initialBlockSize > sizeof(Slot) && "initialBlockSize too small");
+
+	this->slotSize_ = slotSize;
+	this->blockSize_ = initialBlockSize;
+
+	this->pHeadBlock_ = nullptr;
+	this->curSlot_ = nullptr;
+	this->lastSlot_ = nullptr;
+	this->atomicFreeList_.store(nullptr, std::memory_order_relaxed); // 原子地设置为nullptr
+
+	std::cout << "MemoryPool: 初始化完成。槽大小: " << this->slotSize_
+		<< " 字节, 大块大小: " << this->blockSize_ << " 字节。" << std::endl;
+}
 
 
 
+MemoryPool::~MemoryPool() {
+	Slot* currentBlock = this->pHeadBlock_;
+	while (currentBlock != nullptr) {
+		// 对于大块链表的 next，它不是并发访问的，析构时是单线程
+		// 所以可以用 load(relaxed) 或者直接假设其 pNext 是非原子的 Slot*
+		// 但我们 Slot 结构里的 pNext 已经是 atomic 了，所以用 load
+		Slot* nextBlock = currentBlock->pNext.load(std::memory_order_relaxed);
+		operator delete(reinterpret_cast<void*>(currentBlock));
+		currentBlock = nextBlock;
+	}
+	std::cout << "MemoryPool: 所有内存块已释放。" << std::endl;
+}
+
+// 实现 padPointer 静态方法
+size_t MemoryPool::padPointer(char* p, size_t align) {
+	// 使用 uintptr_t 来确保整数类型足够大以存储指针的数值
+	uintptr_t address = reinterpret_cast<uintptr_t>(p);
+	return (align - (address % align)) % align;
+}
+
+// allocateNewBlock 方法本身不需要再加锁，因为它将被 allocate() 在持有锁的情况下调用
+void MemoryPool::allocateNewBlock()
+{
+	char* newBlockStart = reinterpret_cast<char*>(operator new(this->blockSize_));
+	if (newBlockStart == nullptr) {
+		std::cerr << "MemoryPool: (线程 " << std::this_thread::get_id() 
+			<< ") allocateNewBlock 失败，无法分配大块内存 (" 
+			<< this->blockSize_ << " 字节)。" << std::endl;
+		return;
+	}
+	// std::cout << "MemoryPool: (线程 " << std::this_thread::get_id() << ") 成功申请新大块内存，地址: " << static_cast<void*>(newBlockStart) << std::endl;
+
+	// 2. 将新块头插到 pHeadBlock_ 链表中
+	Slot* newBlockHeader = reinterpret_cast<Slot*>(newBlockStart);
+	// newBlockHeader->pNext 的赋值是在当前线程栈上或堆上新分配的内存，没有并发问题
+	// newBlockHeader->pNext = this->pHeadBlock_;
+	// store 是原子操作，确保其他线程可见。
+	newBlockHeader->pNext.store(this->pHeadBlock_, std::memory_order_relaxed); // 如果pNext是atomic
+	this->pHeadBlock_ = newBlockHeader;
+
+
+	// 计算实际用于槽分配的内存区域的起始点 (body)
+	// 大块的头部 sizeof(Slot) 字节被用于链接 (newBlockHeader->pNext)
+	char* body = newBlockStart + sizeof(Slot);
+	size_t padding = MemoryPool::padPointer(body, this->slotSize_);
+
+	this->curSlot_ = reinterpret_cast<Slot*>(body + padding);
+	this->lastSlot_ = reinterpret_cast<Slot*>(newBlockStart + this->blockSize_ - this->slotSize_ + 1);
+
+	// 你项目中 allocateNewBlock 里有 freeList_ = nullptr;
+	// 我们现在有了原子的 atomicFreeList_。如果仍要清空：
+	// this->atomicFreeList_.store(nullptr, std::memory_order_relaxed);
+	// 但如前讨论，这可能导致问题。我们先不加，除非后续证明在你项目中这种行为的必要性。
+	// 尤其是在CAS循环的popFreeList失败后才调用allocateNewBlock，此时freeList理论上应为空。
+}
+
+// 实现原子的 pushFreeList (参考你项目)
+bool MemoryPool::pushFreeList(Slot* slot) {
+	if (slot == nullptr) return false;
+	while (true) {
+		Slot* oldHead = this->atomicFreeList_.load(std::memory_order_relaxed); // 读取当前链表头
+		slot->pNext.store(oldHead, std::memory_order_relaxed); // 新节点的next指向旧头
+		// compare_exchange_weak  比较 atomicFreeList_ 的当前值是否等于 oldHead，若是则替换为 slot。
+		// 若失败（其他线程修改了 atomicFreeList_），重新循环。
+		if (this->atomicFreeList_.compare_exchange_weak(oldHead, slot,
+			//std::memory_order_release：确保写操作对后续读可见。
+			//std::memory_order_relaxed：无内存屏障，性能最优。
+			std::memory_order_release,
+			std::memory_order_relaxed)) { 
+			return true; // 成功将新节点设为头
+		}
+		// CAS失败则 oldHead 已被更新为当前 atomicFreeList_ 的值，循环重试
+	}
+}
+
+// 实现原子的 popFreeList (参考你项目)
+Slot* MemoryPool::popFreeList() {
+	while (true) {
+		Slot* oldHead = this->atomicFreeList_.load(std::memory_order_acquire); // 读取当前头
+		if (oldHead == nullptr) {
+			return nullptr; // 链表为空
+		}
+		// 在访问 oldHead->pNext 之前，oldHead 必须是有效的。
+		// 其他线程可能已经弹出了 oldHead 并将其返回给系统或重用，
+		// 这是一个经典的ABA问题点，如果Slot被立即重用且地址相同。
+		// 你项目中的Slot::next是atomic<Slot*>，读取它需要load
+		Slot* newHead = oldHead->pNext.load(std::memory_order_relaxed);
+
+		// 尝试用 newHead替换 oldHead 作为链表头
+		if (this->atomicFreeList_.compare_exchange_weak(oldHead, newHead,
+			std::memory_order_acquire, // 或者 acq_rel
+			std::memory_order_relaxed)) {
+			return oldHead; // 成功，返回弹出的节点
+		}
+		// CAS失败则 oldHead 已被更新，循环重试
+	}
+}
+
+void* MemoryPool::allocate() 
+{
+	// 步骤 1: 尝试从原子的 freeList 分配
+	Slot* slotFromFreeList = this->popFreeList();
+	if (slotFromFreeList != nullptr) {
+		// std::cout << "MemoryPool: (线程 " << std::this_thread::get_id() << ") 从 atomicFreeList 分配于 " << static_cast<void*>(slotFromFreeList) << std::endl;
+		return static_cast<void*>(slotFromFreeList);
+	}
+
+	// 步骤 2: freeList 为空，则从大块内存分配 (加锁)
+	{ // 创建作用域，用于 std::lock_guard
+		std::lock_guard<std::mutex> lock(this->mutexForBlock_);
+		// 在锁内可以再次尝试popFreeList，以减少持有锁时新块的分配。
+		// 但这会稍微复杂化逻辑，你项目中没有这样做，我们保持一致。
+		// Slot* slotAfterLock = this->popFreeList();
+		// if (slotAfterLock) return static_cast<void*>(slotAfterLock);
+
+		if (this->curSlot_ == nullptr || this->curSlot_ >= this->lastSlot_) {
+			this->allocateNewBlock();
+			// 检查 allocateNewBlock 是否成功 (比如 newBlockStart 分配失败导致 curSlot_ 未更新)
+			if (this->curSlot_ == nullptr || this->curSlot_ >= this->lastSlot_) {
+				std::cerr << "MemoryPool: (线程 " << std::this_thread::get_id() << ") 内存严重不足，allocateNewBlock后仍无法分配。" << std::endl;
+				return nullptr; // 释放锁并返回
+			}
+		}
+
+		Slot* allocatedSlot = this->curSlot_;
+		this->curSlot_ = this->curSlot_ + (this->slotSize_ / sizeof(Slot));
+		// std::cout << "MemoryPool: (线程 " << std::this_thread::get_id() << ") 从主块分配于 " << static_cast<void*>(allocatedSlot) << std::endl;
+		return static_cast<void*>(allocatedSlot);
+	} // lock_guard 在此析构，互斥锁被释放
+}
+
+// deallocate 方法在这一步仍然是线程不安全的
+void MemoryPool::deallocate(void* ptr) {
+	if (ptr == nullptr) {
+		return;
+	}
+
+	Slot* slotToFree = static_cast<Slot*>(ptr);
+	this->pushFreeList(slotToFree); // 使用原子的push操作
+	// std::cout << "MemoryPool: (线程 " << std::this_thread::get_id() << ") 回收 " << static_cast<void*>(ptr) << " 到atomicFreeList" << std::endl;
+}
+
+```
+
+#### main.cpp
+```c++
+// 预先向系统申请一大片内存，并交由应用层管理，在程序运行时，
+// 内存的分配和回收都由应用层的内存池处理，从而减少系统调用。
+// 2025年5月24日22:30:30
+
+#include <iostream>
+#include <vector>
+#include "MemoryPool.h"
+#include <thread>    // For std::thread
+#include <atomic>    // For std::atomic_size_t (可选，用于计数)
+#include <cassert>
+#include <list> // 用于保存指针，方便后续回收
+
+const size_t FIXED_DATA_SIZE = 16;
+
+struct MyFixedSizeData {
+    int id;
+    int thread_creator_id; // 用于调试，看是哪个线程创建的
+    char padding[FIXED_DATA_SIZE - sizeof(int) * 2]; // 确保总大小为 FIXED_DATA_SIZE
+};
+
+// 全局内存池实例
+MemoryPool g_pool(FIXED_DATA_SIZE, FIXED_DATA_SIZE * 3 + sizeof(Slot)); // 每个大块能放约3个对象
+
+// 原子计数器：记录总分配次数（线程安全）
+std::atomic<size_t> g_total_allocs(0);
+// 原子计数器：记录总回收次数（线程安全）
+std::atomic<size_t> g_total_deallocs(0);
+// 原子计数器：记录分配失败的次数（线程安全）
+std::atomic<size_t> g_alloc_fails(0);
+
+// 线程本地存储（TLS） ：每个线程拥有自己的 tls_allocated_pointers 实例，彼此独立。
+// 每个线程本地存储自己分配的指针，避免线程间数据竞争
+// 如果去掉 thread_local，所有线程会共享同一个 std::list，导致多线程同时修改时的竞态条件（如插入/删除冲突）。
+thread_local std::list<void*> tls_allocated_pointers;
+/*
+有 thread_local：
+线程A的 tls_allocated_pointers 和 线程B的 tls_allocated_pointers 是两个独立的列表。
+
+无 thread_local：
+所有线程共享同一个列表，可能导致数据混乱。
+*/
 
 
 
+void worker_thread_func_alloc_dealloc(int thread_id, int iterations, int ops_per_iteration) {
+    // std::cout << "线程 " << thread_id << " 开始执行 (分配与回收)。" << std::endl;
+    for (int iter = 0; iter < iterations; ++iter) {
+        // 一轮分配
+        for (int i = 0; i < ops_per_iteration; ++i) {
+            void* p = g_pool.allocate();
+            if (p) {
+                g_total_allocs++;
+                tls_allocated_pointers.push_back(p);
+                MyFixedSizeData* data = static_cast<MyFixedSizeData*>(p);
+
+                // g_total_allocs 是一个 std::atomic<size_t> ：
+                // load() 方法用于原子地读取 g_total_allocs 的值，确保线程安全。
+                data->id = g_total_allocs.load(); // 用一个全局唯一的id
+
+                data->thread_creator_id = thread_id;
+            }
+            else {
+                g_alloc_fails++;
+            }
+        }
+
+        // 一轮回收 (回收一部分)
+        int dealloc_count = 0;
+        int num_to_dealloc = tls_allocated_pointers.size() / 2; // 回收一半
+        for (int i = 0; i < num_to_dealloc && !tls_allocated_pointers.empty(); ++i) {
+            void* p_to_free = tls_allocated_pointers.front();
+            tls_allocated_pointers.pop_front();
+            g_pool.deallocate(p_to_free);
+            g_total_deallocs++;
+            dealloc_count++;
+        }
+        // std::cout << "线程 " << thread_id << " 回收了 " << dealloc_count << " 个对象。" << std::endl;
+    }
+
+    // 线程结束前，回收所有剩余的本地分配的指针
+    while (!tls_allocated_pointers.empty()) {
+        void* p_to_free = tls_allocated_pointers.front();
+        tls_allocated_pointers.pop_front();
+        g_pool.deallocate(p_to_free);
+        g_total_deallocs++;
+    }
+    // std::cout << "线程 " << thread_id << " 执行完毕。" << std::endl;
+}
+
+int main() {
+    const int num_threads = 8; // 增加线程数
+    const int iterations_per_thread = 5;
+    const int allocs_deallocs_per_iteration = 10; // 每次迭代中分配/回收操作的数量
+
+    std::cout << "MemoryPool 测试 (第六步：原子操作 freeList_)" << std::endl;
+    std::cout << "sizeof(MyFixedSizeData): " << sizeof(MyFixedSizeData)
+        << ", sizeof(Slot): " << sizeof(Slot)
+        << ", FIXED_DATA_SIZE: " << FIXED_DATA_SIZE << std::endl;
+
+    assert(FIXED_DATA_SIZE >= sizeof(Slot));
+    // 如果 Slot::pNext 是 atomic<Slot*>，sizeof(Slot) 可能仍是 sizeof(Slot*)
+    // 我们的 Slot 只有一个 atomic<Slot*> pNext;
+    // 确保 slotSize_ 是 sizeof(Slot) 的倍数
+    assert(FIXED_DATA_SIZE % (sizeof(std::atomic<Slot*>)) == 0 || FIXED_DATA_SIZE % (sizeof(void*)) == 0);
+
+
+    std::vector<std::thread> threads;
+    threads.reserve(num_threads);
+
+    std::cout << "启动 " << num_threads << " 个线程, 每个线程执行 "
+        << iterations_per_thread << " 轮迭代 ("
+        << allocs_deallocs_per_iteration << "次分配/轮, 回收一半/轮)..." << std::endl;
+
+    for (int i = 0; i < num_threads; ++i) {
+        threads.emplace_back(worker_thread_func_alloc_dealloc, i + 1, iterations_per_thread, allocs_deallocs_per_iteration);
+    }
+
+    for (std::thread& t : threads) {
+        if (t.joinable()) {
+            t.join();
+        }
+    }
+
+    std::cout << "\n--- 测试完成 ---" << std::endl;
+    std::cout << "总成功分配次数: " << g_total_allocs.load() << std::endl;
+    std::cout << "总回收次数: " << g_total_deallocs.load() << std::endl;
+    std::cout << "总分配失败次数: " << g_alloc_fails.load() << std::endl;
+    size_t expected_total_requests = num_threads * iterations_per_thread * allocs_deallocs_per_iteration;
+    std::cout << "预期总分配请求次数: " << expected_total_requests << std::endl;
+
+    if (g_total_allocs.load() == g_total_deallocs.load() && g_alloc_fails.load() == 0 && g_total_allocs.load() == expected_total_requests) {
+        std::cout << "所有分配和回收操作计数匹配，且无失败！" << std::endl;
+    }
+    else {
+        std::cout << "警告：分配/回收计数不匹配或有失败。" << std::endl;
+    }
+    // 在这里可以添加一个最终的检查，比如尝试分配所有理论上可用的槽，看是否能全部拿到，
+    // 以验证没有内存因为错误的回收逻辑而“丢失”在池内。但这比较复杂。
+
+    return 0;
+}
+```
+
+实现了原子操作的空闲链表。
 
