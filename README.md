@@ -1957,3 +1957,16 @@ int main() {
 
 实现了原子操作的空闲链表。
 
+
+
+#### 项目基本结构与程序执行流程
+
+图片内容未校验，但辅助理解基本问题不大。
+
+std::memory_order_release 这种类似的还未详细介绍。
+
+程序以跑通，实现了`std::atomic<Slot*> atomicFreeList_`。
+
+![image](img/项目基本结构.png)
+
+![image](img/程序执行流程.png)
