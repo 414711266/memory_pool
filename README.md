@@ -1965,8 +1965,164 @@ int main() {
 
 std::memory_order_release 这种类似的还未详细介绍。
 
-程序以跑通，实现了`std::atomic<Slot*> atomicFreeList_`。
+程序已跑通，实现了`std::atomic<Slot*> atomicFreeList_`。
 
 ![image](img/项目基本结构.png)
 
 ![image](img/程序执行流程.png)
+
+#### 空闲链表的原子操作
+
+在多线程环境中，当多个线程可能同时访问和修改共享数据时，我们需要确保操作的**原子性**和**可见性/顺序性**。
+
+- **原子性 (Atomicity)：** 一个操作要么完全执行，要么完全不执行，不会出现执行到一半被其他线程打断的情况。std::atomic<T> 保证了其封装的值的基本操作（如读、写、CAS）是原子的。
+- **可见性 (Visibility) / 顺序性 (Ordering)：** 当一个线程修改了共享数据，其他线程什么时候能“看到”这个修改？CPU和编译器为了优化，可能会重排指令的执行顺序。内存序就是用来告诉编译器和CPU，在原子操作周围，哪些指令重排是允许的，哪些是不允许的，以及如何确保一个线程的写入对其他线程可见。
+
+**std::atomic 的常见成员函数**
+
+1. **load(std::memory_order order = std::memory_order_seq_cst) const noexcept;**
+   - **作用：** 原子地读取 std::atomic 对象所持有的值。
+   - **返回值：** 读取到的值。
+   - **std::memory_order order 参数 (内存序)：** 控制此加载操作的同步行为和顺序约束。
+2. **store(T desired, std::memory_order order = std::memory_order_seq_cst) noexcept;**
+   - **作用：** 原子地用 desired 值替换 std::atomic 对象所持有的值。
+   - **std::memory_order order 参数 (内存序)：** 控制此存储操作的同步行为和顺序约束。
+3. **bool compare_exchange_weak(T& expected, T desired, std::memory_order success_order, std::memory_order failure_order) noexcept;**
+   (还有一个 compare_exchange_strong 版本，区别在于 weak 可能伪失败)
+   - **作用 (CAS - Compare-and-Swap)：** 这是实现无锁算法的核心。
+     1. **比较：** 原子地比较原子对象当前的值与 expected 的值。
+     2. **如果相等：** 原子地将原子对象的值修改为 desired，并返回 true。使用 success_order 作为此读-改-写操作的内存序。
+     3. **如果不相等：** **不修改**原子对象的值，但是会**将原子对象的当前值加载到 expected 中**（这就是为什么 expected 是一个引用），并返回 false。使用 failure_order 作为此加载操作的内存序。
+   - **参数：**
+     - T& expected: 传入时是你期望原子对象的当前值。如果CAS失败，它会被更新为原子对象的实际当前值。
+     - T desired: 如果CAS成功，原子对象将被设置为这个值。
+     - std::memory_order success_order: CAS成功时的内存序。
+     - std::memory_order failure_order: CAS失败时（只发生加载操作）的内存序。failure_order 不能比 success_order 更强（例如，如果 success_order 是 relaxed，failure_order 不能是 acquire）。
+
+```c++
+Slot* MemoryPool::popFreeList() {
+    while (true) {
+        // 1. Slot* oldHead = this->atomicFreeList_.load(std::memory_order_acquire);
+        //    含义：原子地读取 atomicFreeList_ 的当前头指针。
+        //    std::memory_order_acquire：
+        //    - 保证：在此 load 操作之后的任何代码（在本线程内）都不能被重排到这个 load 之前。
+        //    - 同步：如果这个 oldHead 是由其他线程通过一个 release 操作（比如在 pushFreeList 中）设置的，
+        //           那么这个 acquire 操作能确保看到那个 release 操作之前的所有对 oldHead 指向的 Slot
+        //           （以及其 pNext）所做的修改。简单说，如果成功拿到一个非空的 oldHead，
+        //           那么它的 pNext 字段的内容是可靠的（被正确设置过的）。
+        Slot* oldHead = this->atomicFreeList_.load(std::memory_order_acquire);
+
+        if (oldHead == nullptr) {
+            return nullptr; // 链表为空，没什么可做的
+        }
+
+        // 2. Slot* newHead = oldHead->pNext.load(std::memory_order_relaxed);
+        //    含义：原子地读取 oldHead 指向的 Slot 节点的 pNext 指针。
+        //    std::memory_order_relaxed：
+        //    - 为什么是 relaxed？因为我们已经通过上面的 acquire load 获取了 oldHead。
+        //      一旦我们“安全地”得到了 oldHead，并且知道它的内容是有效的（因为它是由某个release操作发布的），
+        //      那么读取它的 pNext 成员（它本身也是atomic）通常不需要额外的强同步。
+        //      主要的同步点是全局链表头 atomicFreeList_ 的 CAS 操作。
+        //    - 这个 pNext 的值也是由某个 push 操作的 slot->pNext.store(..., relaxed) 设置的。
+        Slot* newHead = oldHead->pNext.load(std::memory_order_relaxed);
+
+        // 3. if (this->atomicFreeList_.compare_exchange_weak(oldHead, newHead,
+        //         std::memory_order_acquire, // 成功时的内存序
+        //         std::memory_order_relaxed)) { // 失败时的内存序
+        //    含义：尝试将全局空闲链表头从 oldHead 原子地更新为 newHead。
+        //    参数：
+        //    - oldHead (T& expected): 我们期望 atomicFreeList_ 当前的值是这个。
+        //    - newHead (T desired): 如果期望匹配，则将 atomicFreeList_ 更新为此值。
+        //    - std::memory_order_acquire (success_order): 如果CAS成功（即我们成功“弹出”了oldHead）：
+        //        - 这个 acquire 保证了如果其他线程在我们之后立即又 push 了一个节点，
+        //          我们的后续操作（如果依赖于链表状态）能看到那个 push 的影响。
+        //        - 更重要的是，它与 pushFreeList 中的 release CAS 形成配对，确保整个操作序列的正确性。
+        //        - 你提供的最终项目中这里用的是 acquire。有时也可能用 acq_rel，如果 pop 操作之后紧接着有依赖于“刚刚弹出的节点不再是头”这个事实的写操作。
+        //          对于简单的 pop，acquire 通常足够。
+        //    - std::memory_order_relaxed (failure_order): 如果CAS失败（意味着有其他线程修改了 atomicFreeList_）：
+        //        - compare_exchange_weak 会将 atomicFreeList_ 的最新值加载回 oldHead。
+        //        - 这个加载操作使用 relaxed 序，因为我们只是获取最新值以便在下一次循环中重试，
+        //          主要的同步在下一次循环开始时的 acquire load。
+        if (this->atomicFreeList_.compare_exchange_weak(oldHead, newHead,
+            std::memory_order_acquire,
+            std::memory_order_relaxed)) {
+            return oldHead; // 成功弹出一个节点
+        }
+        // CAS 失败，循环会继续，oldHead 已经被更新为最新的链表头。
+    }
+}
+```
+
+```c++
+bool MemoryPool::pushFreeList(Slot* slot) {
+    if (slot == nullptr) return false;
+    while (true) {
+        // 1. Slot* oldHead = this->atomicFreeList_.load(std::memory_order_relaxed);
+        //    含义：原子地读取当前空闲链表的头指针。
+        //    std::memory_order_relaxed：
+        //    - 在这里使用 relaxed 是可以的，因为我们只是获取一个“候选”的 oldHead。
+        //      真正的同步和正确性依赖于后续的 CAS 操作。
+        //      即使我们读到了一个稍微过时的 oldHead，后续的 CAS 也会失败并迫使我们重试。
+        Slot* oldHead = this->atomicFreeList_.load(std::memory_order_relaxed);
+
+        // 2. slot->pNext.store(oldHead, std::memory_order_relaxed);
+        //    含义：将要插入的新节点 slot 的 pNext 指针设置为我们刚刚读取到的 oldHead。
+        //    std::memory_order_relaxed：
+        //    - 对 slot->pNext 的写入是针对 slot 这个节点的操作，它还未被“发布”到共享链表中。
+        //    - 这个写入操作的内存在 CAS 成功（release语义）之前，对其他线程是不可见的（除非它们非法访问slot）。
+        //    - relaxed 在这里是安全的。
+        slot->pNext.store(oldHead, std::memory_order_relaxed);
+
+        // 3. if (this->atomicFreeList_.compare_exchange_weak(oldHead, slot,
+        //         std::memory_order_release,     // 成功时的内存序
+        //         std::memory_order_relaxed)) {  // 失败时的内存序
+        //    含义：尝试将全局空闲链表头从 oldHead 原子地更新为 slot (新插入的节点)。
+        //    参数：
+        //    - oldHead (T& expected): 期望 atomicFreeList_ 当前是这个值。
+        //    - slot (T desired): 如果匹配，则将 atomicFreeList_ 更新为此新节点。
+        //    - std::memory_order_release (success_order): 如果CAS成功（新节点成为头）：
+        //        - 这是一个“释放”操作。它确保在此CAS操作之前的所有内存写入（特别是对 `slot->pNext` 的写入）
+        //          对于之后通过 `acquire` 操作（比如在 popFreeList 中）成功读取 `atomicFreeList_`
+        //          并最终访问到这个 `slot` 节点的其他线程来说，是可见的。
+        //        - 这是非常关键的，它保证了当其他线程 pop 出这个 `slot` 时，它的 `pNext` 字段是正确的。
+        //    - std::memory_order_relaxed (failure_order): CAS失败时的加载，同 popFreeList。
+        if (this->atomicFreeList_.compare_exchange_weak(oldHead, slot,
+            std::memory_order_release,
+            std::memory_order_relaxed)) {
+            return true; // 成功将新节点加入链表头
+        }
+        // CAS 失败，循环重试。
+    }
+}
+```
+
+
+
+### 七、构建 `HashBucket` 管理器和 `newElement`/`deleteElement` 接口
+
+此步骤会把所有逻辑整合起来。`MemoryPool` 类的代码基本不变，主要是在 `MemoryPool.h` 和 `MemoryPool.cpp` 中增加 `HashBucket` 的相关代码，并提供一个全新的 `main.cpp` 来进行 UnitTest。
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
